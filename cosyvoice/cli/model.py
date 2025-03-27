@@ -165,37 +165,64 @@ class CosyVoiceModel:
             llm_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
             flow_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
             prompt_speech_feat=torch.zeros(1, 0, 80), stream=False, speed=1.0, **kwargs):
-        # this_uuid is used to track variables related to this inference thread
+        """语音合成主函数
+        
+        Args:
+            text: 待合成文本的token序列
+            flow_embedding: Flow模型的嵌入向量
+            llm_embedding: LLM模型的嵌入向量,默认为零向量
+            prompt_text: 参考文本的token序列,默认为空
+            llm_prompt_speech_token: LLM模型使用的参考语音token,默认为空
+            flow_prompt_speech_token: Flow模型使用的参考语音token,默认为空
+            prompt_speech_feat: 参考语音特征,默认为空
+            stream: 是否使用流式推理,默认False
+            speed: 语速调节因子,默认1.0
+            **kwargs: 其他参数
+            
+        Yields:
+            dict: 包含合成语音的字典,键为'tts_speech'
+        """
+        # 为当前推理线程创建唯一标识符
         this_uuid = str(uuid.uuid1())
         with self.lock:
+            # 初始化与当前推理相关的缓存和状态变量
             self.tts_speech_token_dict[this_uuid], self.llm_end_dict[this_uuid] = [], False
             self.hift_cache_dict[this_uuid] = None
             self.mel_overlap_dict[this_uuid] = torch.zeros(1, 80, 0)
             self.flow_cache_dict[this_uuid] = torch.zeros(1, 80, 0, 2)
+        # 启动LLM推理线程,生成语音token序列
         p = threading.Thread(target=self.llm_job, args=(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid))
         p.start()
         if stream is True:
+            # 流式推理模式
             token_hop_len = self.token_min_hop_len
             while True:
                 time.sleep(0.1)
+                # 当累积的token数量足够时,进行一次推理
                 if len(self.tts_speech_token_dict[this_uuid]) >= token_hop_len + self.token_overlap_len:
+                    # 获取当前批次的token
                     this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_hop_len + self.token_overlap_len]) \
                         .unsqueeze(dim=0)
+                    # 将token转换为波形
                     this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                                      prompt_token=flow_prompt_speech_token,
                                                      prompt_feat=prompt_speech_feat,
                                                      embedding=flow_embedding,
                                                      uuid=this_uuid,
                                                      finalize=False)
+                    # 返回当前批次的合成语音
                     yield {'tts_speech': this_tts_speech.cpu()}
                     with self.lock:
+                        # 移除已处理的token
                         self.tts_speech_token_dict[this_uuid] = self.tts_speech_token_dict[this_uuid][token_hop_len:]
-                    # increase token_hop_len for better speech quality
+                    # 动态增加token处理长度,提高语音质量
                     token_hop_len = min(self.token_max_hop_len, int(token_hop_len * self.stream_scale_factor))
+                # 当LLM生成结束且剩余token不足时,退出循环
                 if self.llm_end_dict[this_uuid] is True and len(self.tts_speech_token_dict[this_uuid]) < token_hop_len + self.token_overlap_len:
                     break
+            # 等待LLM线程结束
             p.join()
-            # deal with remain tokens, make sure inference remain token len equals token_hop_len when cache_speech is not None
+            # 处理剩余的token
             this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
             this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                              prompt_token=flow_prompt_speech_token,
@@ -205,8 +232,10 @@ class CosyVoiceModel:
                                              finalize=True)
             yield {'tts_speech': this_tts_speech.cpu()}
         else:
-            # deal with all tokens
+            # 非流式推理模式
+            # 等待LLM线程完成所有token生成
             p.join()
+            # 一次性处理所有token
             this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
             this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                              prompt_token=flow_prompt_speech_token,
@@ -216,14 +245,15 @@ class CosyVoiceModel:
                                              finalize=True,
                                              speed=speed)
             yield {'tts_speech': this_tts_speech.cpu()}
+        # 清理当前推理线程的所有缓存和状态
         with self.lock:
             self.tts_speech_token_dict.pop(this_uuid)
             self.llm_end_dict.pop(this_uuid)
             self.mel_overlap_dict.pop(this_uuid)
             self.hift_cache_dict.pop(this_uuid)
             self.flow_cache_dict.pop(this_uuid)
+        # 释放GPU缓存
         torch.cuda.empty_cache()
-
     def vc(self, source_speech_token, flow_prompt_speech_token, prompt_speech_feat, flow_embedding, stream=False, speed=1.0, **kwargs):
         # this_uuid is used to track variables related to this inference thread
         this_uuid = str(uuid.uuid1())

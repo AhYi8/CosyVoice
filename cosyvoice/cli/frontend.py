@@ -119,53 +119,117 @@ class CosyVoiceFrontEnd:
         return speech_feat, speech_feat_len
 
     def text_normalize(self, text, split=True, text_frontend=True):
+        """文本标准化处理函数
+        
+        将输入文本进行标准化处理，包括中文和英文的不同处理方式，
+        并可选择是否将文本分段。
+        
+        Args:
+            text (str或Generator): 需要标准化的文本或文本生成器
+            split (bool, optional): 是否将文本分段返回。默认为True
+            text_frontend (bool, optional): 是否使用文本前端处理。默认为True
+            
+        Returns:
+            list或str: 根据split参数返回处理后的文本列表或文本字符串
+        """
+        # 如果输入是生成器，则跳过标准化处理
         if isinstance(text, Generator):
             logging.info('get tts_text generator, will skip text_normalize!')
             return [text]
+        
+        # 如果不使用文本前端处理，直接返回
         if text_frontend is False:
             return [text] if split is True else text
+            
+        # 去除文本两端空白
         text = text.strip()
+        
+        # 使用TTS前端处理系统
         if self.use_ttsfrd:
             texts = [i["text"] for i in json.loads(self.frd.do_voicegen_frd(text))["sentences"]]
             text = ''.join(texts)
         else:
+            # 中文文本处理
             if contains_chinese(text):
+                # 使用中文标准化模型
                 text = self.zh_tn_model.normalize(text)
+                # 移除换行符
                 text = text.replace("\n", "")
+                # 替换空白字符
                 text = replace_blank(text)
+                # 替换角标符号
                 text = replace_corner_mark(text)
+                # 标点符号替换
                 text = text.replace(".", "。")
                 text = text.replace(" - ", "，")
+                # 移除括号内容
                 text = remove_bracket(text)
+                # 将末尾的逗号等替换为句号
                 text = re.sub(r'[，,、]+$', '。', text)
+                # 分段处理中文文本
                 texts = list(split_paragraph(text, partial(self.tokenizer.encode, allowed_special=self.allowed_special), "zh", token_max_n=80,
                                              token_min_n=60, merge_len=20, comma_split=False))
+            # 英文文本处理
             else:
+                # 使用英文标准化模型
                 text = self.en_tn_model.normalize(text)
+                # 将数字拼写出来
                 text = spell_out_number(text, self.inflect_parser)
+                # 分段处理英文文本
                 texts = list(split_paragraph(text, partial(self.tokenizer.encode, allowed_special=self.allowed_special), "en", token_max_n=80,
                                              token_min_n=60, merge_len=20, comma_split=False))
+        
+        # 过滤掉只包含标点符号的文本段
         texts = [i for i in texts if not is_only_punctuation(i)]
+        
+        # 根据split参数返回文本列表或文本字符串
         return texts if split is True else text
-
     def frontend_sft(self, tts_text, spk_id):
         tts_text_token, tts_text_token_len = self._extract_text_token(tts_text)
-        embedding = self.spk2info[spk_id]['embedding']
-        model_input = {'text': tts_text_token, 'text_len': tts_text_token_len, 'llm_embedding': embedding, 'flow_embedding': embedding}
+        # embedding = self.spk2info[spk_id]['embedding']
+        # model_input = {'text': tts_text_token, 'text_len': tts_text_token_len, 'llm_embedding': embedding, 'flow_embedding': embedding}
+        model_input = self.spk2info[spk_id]
+        model_input["text"] = tts_text_token
+        model_input["text_len"] = tts_text_token_len
         return model_input
 
     def frontend_zero_shot(self, tts_text, prompt_text, prompt_speech_16k, resample_rate):
+        """零样本语音合成前端处理函数
+        
+        该函数处理零样本语音合成所需的输入数据，包括目标文本、参考文本和参考音频，
+        并将它们转换为模型可接受的格式。
+        
+        Args:
+            tts_text (str): 需要合成的目标文本
+            prompt_text (str): 参考音频对应的文本
+            prompt_speech_16k (Tensor): 16kHz采样率的参考音频
+            resample_rate (int): 目标重采样率
+            
+        Returns:
+            dict: 包含模型输入所需的所有特征和参数的字典
+        """
+        # 提取目标文本的token及其长度
         tts_text_token, tts_text_token_len = self._extract_text_token(tts_text)
+        # 提取参考文本的token及其长度
         prompt_text_token, prompt_text_token_len = self._extract_text_token(prompt_text)
+        # 将参考音频从16kHz重采样到目标采样率
         prompt_speech_resample = torchaudio.transforms.Resample(orig_freq=16000, new_freq=resample_rate)(prompt_speech_16k)
+        # 从重采样后的音频中提取语音特征及其长度
         speech_feat, speech_feat_len = self._extract_speech_feat(prompt_speech_resample)
+        # 从原始参考音频中提取语音token及其长度
         speech_token, speech_token_len = self._extract_speech_token(prompt_speech_16k)
+        
+        # 针对CosyVoice2模型的特殊处理
         if resample_rate == 24000:
-            # cosyvoice2, force speech_feat % speech_token = 2
+            # 确保speech_feat和speech_token的比例为2:1
             token_len = min(int(speech_feat.shape[1] / 2), speech_token.shape[1])
             speech_feat, speech_feat_len[:] = speech_feat[:, :2 * token_len], 2 * token_len
             speech_token, speech_token_len[:] = speech_token[:, :token_len], token_len
+            
+        # 从参考音频中提取说话人嵌入向量
         embedding = self._extract_spk_embedding(prompt_speech_16k)
+        
+        # 构建模型输入字典
         model_input = {'text': tts_text_token, 'text_len': tts_text_token_len,
                        'prompt_text': prompt_text_token, 'prompt_text_len': prompt_text_token_len,
                        'llm_prompt_speech_token': speech_token, 'llm_prompt_speech_token_len': speech_token_len,
@@ -173,7 +237,6 @@ class CosyVoiceFrontEnd:
                        'prompt_speech_feat': speech_feat, 'prompt_speech_feat_len': speech_feat_len,
                        'llm_embedding': embedding, 'flow_embedding': embedding}
         return model_input
-
     def frontend_cross_lingual(self, tts_text, prompt_speech_16k, resample_rate):
         model_input = self.frontend_zero_shot(tts_text, '', prompt_speech_16k, resample_rate)
         # in cross lingual mode, we remove prompt in llm

@@ -63,8 +63,9 @@ class CosyVoice:
         spks = list(self.frontend.spk2info.keys())
         return spks
 
+    # 修改为多线程处理注意yield的顺序，不需要等待所有线程执行完再yield，线程执行完就立即yield，前提要保存顺序一致
     def inference_sft(self, tts_text, spk_id, stream=False, speed=1.0, text_frontend=True):
-        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+        for i in tqdm(self.frontend.text_normalize(tts_text, split=False, text_frontend=text_frontend)):
             model_input = self.frontend.frontend_sft(i, spk_id)
             start_time = time.time()
             logging.info('synthesis text {}'.format(i))
@@ -75,19 +76,40 @@ class CosyVoice:
                 start_time = time.time()
 
     def inference_zero_shot(self, tts_text, prompt_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True):
+        """零样本语音合成推理函数
+        
+        Args:
+            tts_text (str): 需要合成的目标文本
+            prompt_text (str): 参考音频对应的文本
+            prompt_speech_16k (Tensor): 16kHz采样率的参考音频
+            stream (bool, optional): 是否使用流式推理. Defaults to False.
+            speed (float, optional): 语速调节参数. Defaults to 1.0.
+            text_frontend (bool, optional): 是否使用文本前端处理. Defaults to True.
+            
+        Yields:
+            dict: 包含合成音频等信息的字典
+        """
+        # 对参考文本进行标准化处理
         prompt_text = self.frontend.text_normalize(prompt_text, split=False, text_frontend=text_frontend)
+        
+        # 对目标文本进行标准化处理并迭代
         for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+            # 检查目标文本长度是否过短
             if (not isinstance(i, Generator)) and len(i) < 0.5 * len(prompt_text):
                 logging.warning('synthesis text {} too short than prompt text {}, this may lead to bad performance'.format(i, prompt_text))
+            
+            # 准备模型输入
             model_input = self.frontend.frontend_zero_shot(i, prompt_text, prompt_speech_16k, self.sample_rate)
             start_time = time.time()
             logging.info('synthesis text {}'.format(i))
+            
+            # 执行语音合成并迭代输出
             for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
+                # 计算生成语音长度和实时率(RTF)
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
                 logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
                 yield model_output
                 start_time = time.time()
-
     def inference_cross_lingual(self, tts_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True):
         for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
             model_input = self.frontend.frontend_cross_lingual(i, prompt_speech_16k, self.sample_rate)

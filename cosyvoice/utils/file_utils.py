@@ -39,13 +39,29 @@ def read_json_lists(list_file):
 
 
 def load_wav(wav, target_sr):
+    """加载并处理音频文件
+    
+    Args:
+        wav (str): 音频文件路径
+        target_sr (int): 目标采样率
+        
+    Returns:
+        torch.Tensor: 处理后的单声道音频张量
+        
+    Notes:
+        1. 使用soundfile作为后端加载音频
+        2. 将多声道音频转换为单声道
+        3. 如果原采样率高于目标采样率,则进行降采样
+    """
+    # 加载音频文件
     speech, sample_rate = torchaudio.load(wav, backend='soundfile')
+    # 转换为单声道
     speech = speech.mean(dim=0, keepdim=True)
+    # 如果需要,进行采样率转换
     if sample_rate != target_sr:
         assert sample_rate > target_sr, 'wav sample rate {} must be greater than {}'.format(sample_rate, target_sr)
         speech = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sr)(speech)
     return speech
-
 
 def convert_onnx_to_trt(trt_model, onnx_model, fp16):
     import tensorrt as trt
